@@ -1,100 +1,119 @@
-provider "aws" {  
+provider "aws" {
   region = "us-east-1"
 }
 
-resource "aws_budgets_budget" "titan_budget" {
-  name         = "titan-fintech-monthly-budget"
-  budget_type  = "COST"
-  limit_amount = "10.00"
-  limit_unit   = "USD"
-  time_unit    = "MONTHLY"
-
-  notification {
-    comparison_operator = "GREATER_THAN"
-    threshold           = 80
-    threshold_type      = "PERCENTAGE"
-    notification_type   = "ACTUAL"
-    subscriber_email_addresses = ["kpriester88@gmail.com"]
-  }
+# --- DATA SOURCES (Linked to iam_provided.tf resources) ---
+data "aws_iam_role" "flow_log_role" {
+  name = aws_iam_role.flow_log_role.name
 }
 
-resource "random_id" "vault_id" {
-  byte_length = 4
+data "aws_iam_instance_profile" "ssm_profile" {
+  name = aws_iam_instance_profile.ssm_profile.name
 }
 
-resource "aws_s3_bucket" "vault" {
-  bucket = "titan-fintech-vault-kp-${random_id.vault_id.hex}"
-}
-
-# Ensure the bucket is private by default
-resource "aws_s3_bucket_public_access_block" "vault_access" {
-  bucket = aws_s3_bucket.vault.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# 1. The Trust Policy (AssumeRole)
-data "aws_iam_policy_document" "ec2_assume_role" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role" "titan_role" {
-  name               = "titan-ec2-vault-role"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
-}
-
-# 2. The Surgical Permission Policy
-data "aws_iam_policy_document" "s3_write_only" {
-  statement {
-    actions   = ["s3:PutObject"]
-    resources = ["${aws_s3_bucket.vault.arn}/*"]
-  }
-}
-
-resource "aws_iam_policy" "vault_write_policy" {
-  name   = "titan-vault-write-policy"
-  policy = data.aws_iam_policy_document.s3_write_only.json
-}
-
-resource "aws_iam_role_policy_attachment" "attach_policy" {
-  role       = aws_iam_role.titan_role.name
-  policy_arn = aws_iam_policy.vault_write_policy.arn
-}
-
-resource "aws_iam_instance_profile" "titan_profile" {
-  name = "titan-ec2-instance-profile"
-  role = aws_iam_role.titan_role.name
-}
-
-# This tells Terraform: "Find me the latest Ubuntu 22.04 in WHATEVER region I am currently in"
-data "aws_ami" "latest_ubuntu" {
+data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["099720109477"]
-
   filter {
     name   = "name"
     values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+  owners = ["099720109477"] # Canonical
 }
 
-resource "aws_instance" "app" {
-  # This dynamically pulls the correct ID for your region
-  ami           = data.aws_ami.latest_ubuntu.id 
-  instance_type = "t2.micro"
-  
-  iam_instance_profile = aws_iam_instance_profile.titan_profile.name
+# --- THE PERIMETER (VPC & Networking) ---
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
-    Name = "Titan-FinTech-App-Server"
+    Name = "titan-prod-vpc"
+  }
+}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "titan-public-subnet"
+  }
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "titan-igw"
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
   }
 
-  depends_on = [aws_iam_role_policy_attachment.attach_policy]
+  tags = {
+    Name = "titan-public-rt"
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+# --- THE WIRETAP (CloudWatch & VPC Flow Logs) ---
+resource "aws_cloudwatch_log_group" "flow_logs" {
+  name              = "/tkh/titan-prod-vpc-logs"
+  retention_in_days = 1
+}
+
+resource "aws_flow_log" "vpc_flow_log" {
+  iam_role_arn    = data.aws_iam_role.flow_log_role.arn
+  log_destination = aws_cloudwatch_log_group.flow_logs.arn
+  traffic_type    = "ALL"
+  vpc_id          = aws_vpc.main.id
+}
+
+# --- THE ZERO TRUST COMPUTE (Security Group & Instance) ---
+resource "aws_security_group" "zerotrust_sg" {
+  name        = "titan-zerotrust-sg"
+  description = "Zero trust SG with zero inbound and full outbound"
+  vpc_id      = aws_vpc.main.id
+
+  # ZERO inbound ports allowed
+  ingress = []
+
+  # Full outbound egress to allow SSM agent communication
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "titan-zerotrust-sg"
+  }
+}
+
+resource "aws_instance" "app_server" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t2.micro"
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.zerotrust_sg.id]
+  iam_instance_profile   = data.aws_iam_instance_profile.ssm_profile.name
+
+  tags = {
+    Name = "titan-prod-ec2"
+  }
 }
